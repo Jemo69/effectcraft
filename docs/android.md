@@ -40,13 +40,14 @@ network filesystems and WSL (`corrupt incremental compilation artifact … dep-g
 format`), and Android target dirs link slowly anyway.
 
 `cargo xtask layers` assigns the crate to L6 like the other apps, and `cargo xtask ci` keeps it
-building on the host (on anything but Android the crate is an empty `rlib`).
+building on the host: the shell itself is Android-only, while the in-app browser and preview
+audio it wires up are platform-neutral, so the gate lints and tests them on the desktop too.
 
 ## What the Android shell does differently
 
 | Desktop | Android |
 |---|---|
-| `rfd` file and message dialogs | in-app browser (`Hooks::file_dialog_async` in `apps/effectcraft-android/src/file_browser.rs`): the workspace's own internal storage plus shared `Download`/`DCIM` when readable; the commands stay drivable with `paths`/`path` parameters too, as on the web |
+| `rfd` file and message dialogs | in-app browser (`Hooks::file_dialog_async` in `apps/effectcraft-android/src/file_browser.rs`): the workspace's own internal storage, with `Download`/`DCIM` offered as Location shortcuts when readable; the commands stay drivable with `paths`/`path` parameters too, as on the web |
 | `cpal` preview audio | wired to AAudio through cpal (`src/audio_out.rs`, same design as the desktop app); needs API 26 (Android 8.0), so `min_sdk_version` is 26 |
 | config directory (`~/…/EffectCraft`) | the app's own internal storage, `<internal data>/EffectCraft` (settings, shortcuts, auto-saves, models, `Plug-ins`, `Logs/`), from `AndroidApp::internal_data_path` — there is no `HOME` on Android |
 | window geometry tracker, macOS menu bar, launch guard | not needed: one full-screen window, no menu bar |
@@ -70,17 +71,22 @@ is attached.
 
 ## Known gaps (first slice)
 
-- **File dialogs**: the in-app browser covers internal storage and shared folders when
-  readable; there is no system picker (that needs Java) and no runtime permission request yet,
-  so shared storage outside `Download`/`DCIM` may be unreadable — type the path or copy the
-  file into the app's folder in that case.
+- **File dialogs**: the in-app browser covers internal storage, and offers shared
+  `Download`/`DCIM` as Location shortcuts when the platform lets us read them. It wires
+  `Hooks::file_dialog_async` for command dialogs only. The blocking pickers used by Settings
+  paths, Render Queue output and script import/export are not wired, so those controls stay
+  unsupported on Android; commands remain drivable over the control channel with explicit
+  `paths`/`path` parameters. There is no system picker (that needs Java) and no runtime
+  permission request yet, so other shared folders are out of reach; copy the file into the app's
+  folder and pick it there in that case.
+- **Browser labels** are English strings: `effectcraft-ui-egui` keeps its translation lookup
+  private to the crate, so this first slice does not route them through the language catalog.
 - **Preview audio**: wired through cpal/AAudio (API 26+); untested on a physical tablet, and
   there is no Bluetooth-route picker yet (Settings ▸ Audio lists what cpal reports).
 - **Soft keyboard / IME**: shown via winit 0.30 on focus; untested on a physical tablet with
   gesture navigation.
-- **System bars stay visible**: the taskbar is inset around (nothing is covered), not hidden.
-  Hiding it needs a Java call on the UI thread, which a native activity cannot make without
-  shipping a `classes.dex`.
+- **System bars stay visible**: the taskbar is inset around (nothing is covered), not hidden;
+  hiding it is not implemented yet.
 - **Screen orientation** is locked to landscape; portrait and freeform windows work but are
   untested with the desktop-style dock layout.
 

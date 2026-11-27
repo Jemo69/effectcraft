@@ -8,16 +8,15 @@
 //! dialogs use an in-app browser (no `rfd` on Android), preview audio goes through cpal/AAudio,
 //! and settings, auto-saves and the session log live in the app's own internal storage.
 //!
-//! On every other target the crate compiles to an empty `rlib`, so `cargo build` and
-//! `cargo xtask ci` stay green on the desktop.
+//! The shell itself is Android-only; the in-app browser and the preview audio it wires up are
+//! platform-neutral, so on every other target they stay in the build and `cargo xtask ci` lints
+//! and tests them on the desktop.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 #[cfg(target_os = "android")]
 mod android;
-#[cfg(target_os = "android")]
-mod audio_out;
-#[cfg(target_os = "android")]
-mod file_browser;
+pub mod audio_out;
+pub mod file_browser;
 
 /// The entry point `android-activity`'s glue calls, by symbol name, on the thread it spawns for
 /// the activity: an `extern "Rust"` function, so plain Rust ABI, not `extern "C"`.

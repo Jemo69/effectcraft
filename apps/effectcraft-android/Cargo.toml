@@ -26,15 +26,21 @@ type_complexity = "allow"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# Android-only: the crate is an empty `rlib` elsewhere, so `cargo build` and `cargo xtask ci`
-# stay green on the desktop.
+# The in-app file browser and the preview audio the shell wires up: platform-neutral, so they
+# compile (and their tests run) on the host too — `cargo xtask ci` lints and tests them there.
+# The shell itself is Android-only below.
+[dependencies]
+effectcraft-ui-egui = { workspace = true }
+egui = { workspace = true }
+log = { workspace = true }
+# Preview audio through the device's output (AAudio via cpal, same as the desktop app's
+# `audio_out.rs`): the UI stays silent without it. cpal 0.16 supports Android (MIT/Apache-2.0).
+cpal = { workspace = true }
+
 [target.'cfg(target_os = "android")'.dependencies]
 effectcraft-engine = { workspace = true }
 effectcraft-host = { workspace = true }
-effectcraft-ui-egui = { workspace = true }
-egui = { workspace = true }
 serde_json = { workspace = true }
-log = { workspace = true }
 # Blocking on the Vulkan adapter probe of `gpu_backends` before the event loop starts.
 pollster = { workspace = true }
 # `android-native-activity`: a plain `android.app.NativeActivity`, no Java/Kotlin and no Gradle
@@ -43,9 +49,6 @@ eframe = { workspace = true, features = ["default_fonts", "wgpu", "links", "andr
 # The `AndroidApp` of `android_main`; the same `android-activity` glue eframe/winit use, taken
 # from winit's re-export so the versions cannot diverge.
 winit = { version = "0.30", default-features = false, features = ["android-native-activity"] }
-# Preview audio through the device's output (AAudio via cpal, same as the desktop app's
-# `audio_out.rs`): the UI stays silent without it. cpal 0.16 supports Android (MIT/Apache-2.0).
-cpal = { workspace = true }
 
 [package.metadata.android]
 # The desktop app's id, so the package reads as the same application.

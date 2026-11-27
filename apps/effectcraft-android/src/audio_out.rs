@@ -152,8 +152,8 @@ impl AudioDevice for CpalOut {
                 };
                 let mut cfg: cpal::StreamConfig = sup.config();
                 cfg.sample_rate = cpal::SampleRate(rate);
-                // AAudio already runs low-latency; keep the default buffer unless the device
-                // reports a fixed range that wants clamping.
+                // AAudio already runs low-latency; keep the device's default buffer on Android
+                // and clamp only where the host's default can be very long.
                 if !cfg!(target_os = "android") {
                     let want = preferred_buffer_frames(rate);
                     cfg.buffer_size = match sup.buffer_size() {

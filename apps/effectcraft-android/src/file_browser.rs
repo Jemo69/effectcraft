@@ -27,6 +27,8 @@ pub struct Pending {
     error: Option<String>,
     selected: Vec<PathBuf>,
     filename: String,
+    /// Where the browser can start again: app-private storage, then shared folders when readable.
+    roots: Vec<PathBuf>,
     done: Option<DialogDone>,
 }
 
@@ -81,12 +83,21 @@ pub fn is_project(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("ecproj") || e.eq_ignore_ascii_case("ecprojx"))
 }
 
-/// The filename field's initial value for a save dialog, clamped to 128 chars.
+/// A name the browser can save inside its current folder: one relative component, not `.`,
+/// `..`, an absolute path or anything with a separator. `Path::join` with one of those would
+/// escape the folder the user was shown.
+pub fn valid_save_name(name: &str) -> bool {
+    let name = name.trim();
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\') && !Path::new(name).is_absolute()
+}
+
+/// The filename field's initial value for a save dialog, clamped to 128 chars. A default that
+/// has no usable file name (`..`, `/`) becomes a fresh project name.
 pub fn save_default(request: &FileDialog) -> String {
     match request {
         FileDialog::Save { default, .. } => {
-            let name = Path::new(default).file_name().and_then(|n| n.to_str()).unwrap_or(default);
-            if name.is_empty() {
+            let name = Path::new(default).file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            if !valid_save_name(name) {
                 return "Untitled Project.ecproj".to_string();
             }
             let mut end = name.len().min(128);
@@ -137,15 +148,24 @@ pub fn can_pick(request: &FileDialog, entry: &Entry) -> bool {
 }
 
 /// Store a new pending request and wake the UI. The browser starts in `start_dir` (or the
-/// first root). Never blocks; I/O errors show inside the browser.
+/// first root). Never blocks; I/O errors show inside the browser. A request that arrives while
+/// another dialog is up cancels the old one through its `done`, so the command that asked for it
+/// cannot wait forever (the browser is not modal and the control channel can run commands).
 pub fn request(pending: &Arc<Mutex<Option<Pending>>>, ctx: &egui::Context, dialog: FileDialog, done: DialogDone, start_dir: Option<PathBuf>) {
-    let current = start_dir.filter(|p| p.is_dir()).unwrap_or_else(|| roots(None).into_iter().next().unwrap_or_else(|| PathBuf::from("/")));
+    let roots = roots(start_dir.as_deref());
+    let current = start_dir.filter(|p| p.is_dir()).unwrap_or_else(|| roots.first().cloned().unwrap_or_else(|| PathBuf::from("/")));
     let filename = save_default(&dialog);
     let (entries, error) = match list_dir(&current) {
         Ok(e) => (e, None),
         Err(err) => (Vec::new(), Some(err)),
     };
-    let p = Pending { request: dialog, current, entries, error, selected: Vec::new(), filename, done: Some(done) };
+    let previous = pending.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(previous) = previous
+        && let Some(done) = previous.done
+    {
+        done(Vec::new());
+    }
+    let p = Pending { request: dialog, current, entries, error, selected: Vec::new(), filename, roots, done: Some(done) };
     *pending.lock().unwrap_or_else(PoisonError::into_inner) = Some(p);
     ctx.request_repaint();
 }
@@ -169,6 +189,17 @@ pub fn show(pending: &Arc<Mutex<Option<Pending>>>, ctx: &egui::Context) {
                 && let Some(parent) = p.current.parent().map(Path::to_path_buf)
             {
                 navigate = Some(parent);
+            }
+        });
+        // Roots are buttons, not a claim in the docs: a shared folder only appears when the
+        // platform already lets us read it (see docs/android.md for the permission gap).
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Location:");
+            for root in p.roots.clone() {
+                let name = root.file_name().and_then(|n| n.to_str()).unwrap_or("storage");
+                if ui.button(name).clicked() {
+                    navigate = Some(root);
+                }
             }
         });
         ui.separator();
@@ -210,6 +241,9 @@ pub fn show(pending: &Arc<Mutex<Option<Pending>>>, ctx: &egui::Context) {
                 ui.label("Name:");
                 ui.text_edit_singleline(&mut p.filename);
             });
+            if !valid_save_name(&p.filename) {
+                ui.colored_label(egui::Color32::YELLOW, "Use a file name, not a path");
+            }
         }
         if !p.selected.is_empty() && !matches!(p.request, FileDialog::Save { .. }) && !matches!(p.request, FileDialog::Folder) {
             let shown: Vec<String> = p.selected.iter().filter_map(|s| s.file_name().and_then(|n| n.to_str()).map(str::to_string)).take(3).collect();
@@ -227,7 +261,7 @@ pub fn show(pending: &Arc<Mutex<Option<Pending>>>, ctx: &egui::Context) {
             };
             let can_ok = match &p.request {
                 FileDialog::Folder => true,
-                FileDialog::Save { .. } => !p.filename.trim().is_empty(),
+                FileDialog::Save { .. } => valid_save_name(&p.filename),
                 _ => !p.selected.is_empty(),
             };
             if ui.add_enabled(can_ok, egui::Button::new(ok_label)).clicked() {
@@ -297,6 +331,50 @@ mod tests {
         let long = "x".repeat(300);
         let d = FileDialog::Save { default: long, ext: String::new(), project: false };
         assert!(save_default(&d).len() <= 128);
+    }
+
+    #[test]
+    fn save_name_is_a_single_relative_component() {
+        assert!(valid_save_name("shot 0001.ecproj"));
+        for bad in ["", " ", ".", "..", "../shot.ecproj", "a/b", "/tmp/shot.ecproj", "C:\\shot.ecproj"] {
+            assert!(!valid_save_name(bad), "`{bad}` escapes the folder shown to the user");
+        }
+        // A default without a file name falls back to a safe one; a trailing slash after a
+        // real name still gives that name.
+        for default in ["..", "/"] {
+            let d = FileDialog::Save { default: default.into(), ext: "ecproj".into(), project: true };
+            assert_eq!(save_default(&d), "Untitled Project.ecproj");
+        }
+        let d = FileDialog::Save { default: "/tmp/".into(), ext: "ecproj".into(), project: true };
+        assert_eq!(save_default(&d), "tmp");
+    }
+
+    #[test]
+    fn a_replaced_request_answers_the_previous_one() {
+        let pending = Arc::new(Mutex::new(None));
+        let ctx = egui::Context::default();
+        let answered: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+        let seen = answered.clone();
+        request(
+            &pending,
+            &ctx,
+            FileDialog::Open { exts: Vec::new(), many: false },
+            Box::new(move |paths| *seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(paths)),
+            Some(std::env::temp_dir()),
+        );
+        request(&pending, &ctx, FileDialog::Folder, Box::new(|_| {}), Some(std::env::temp_dir()));
+        // Cancel, not a hang: the command that asked for the first dialog completes.
+        assert_eq!(*answered.lock().unwrap_or_else(PoisonError::into_inner), Some(Vec::new()));
+    }
+
+    #[test]
+    fn request_offers_the_roots_it_can_reach() {
+        let pending = Arc::new(Mutex::new(None));
+        let ctx = egui::Context::default();
+        let data = std::env::temp_dir();
+        request(&pending, &ctx, FileDialog::Folder, Box::new(|_| {}), Some(data.clone()));
+        let guard = pending.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(guard.as_ref().is_some_and(|p| p.roots.contains(&data)));
     }
 
     #[test]
