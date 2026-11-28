@@ -3,8 +3,14 @@
 //! Insert Edit — that cut the marked range into the active composition at its current time.
 //! Everything runs `footage.*` commands (state in `EditorState::footage_panel`).
 
+#[cfg(target_arch = "wasm32")]
+use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{Arc, Mutex, PoisonError};
+
 use crate::i18n::{tr, tr_args};
-use effectcraft_engine::project::{FootageKind, ItemKind};
+use effectcraft_engine::project::{Footage, FootageKind, ItemId, ItemKind};
+use effectcraft_engine::render::FootageSource;
 use effectcraft_engine::time::Tick;
 use egui::{Align2, Color32, Rect, Sense, Stroke, pos2, vec2};
 use serde_json::json;
@@ -12,6 +18,100 @@ use serde_json::json;
 use super::panel_kit as kit;
 use crate::EffectcraftApp;
 use crate::theme::Tokens;
+
+type FootageKey = (u64, i64, u64);
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone, Default)]
+struct AsyncDecode {
+    state: Arc<Mutex<DecodeState>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct DecodeState {
+    inflight: Option<FootageKey>,
+    ready: Option<(FootageKey, egui::ColorImage)>,
+}
+
+/// Request a frame decode off the UI thread (on native/Android) so slow video frames do not
+/// freeze touch/UI responsiveness during Footage panel playback or scrubbing.
+fn poll_or_request_frame(
+    ctx: &egui::Context,
+    source: &Arc<dyn FootageSource>,
+    item: ItemId,
+    footage: &Footage,
+    time: Tick,
+    key: FootageKey,
+    cached: &Option<(FootageKey, egui::TextureHandle, [u32; 2])>,
+) -> (Option<(egui::TextureHandle, [u32; 2])>, bool) {
+    let tid = egui::Id::new("footage-panel-tex");
+    if let Some((k, tex, size)) = cached
+        && *k == key
+    {
+        return (Some((tex.clone(), *size)), false);
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = source;
+        let _ = time;
+        let _ = item;
+        let _ = footage;
+        if let Some(img) = source.frame(item, footage, time) {
+            let size = [img.width, img.height];
+            let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.to_rgba8());
+            let tex = crate::frames::load_fitted(ctx, "footage-panel", ci, egui::TextureOptions::LINEAR);
+            ctx.data_mut(|d| d.insert_temp(tid, (key, tex.clone(), size)));
+            return (Some((tex, size)), false);
+        }
+        return (cached.as_ref().map(|(_, tex, size)| (tex.clone(), *size)), false);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let did = egui::Id::new("footage-panel-decoder");
+        let slot: AsyncDecode = ctx.data(|d| d.get_temp(did)).unwrap_or_default();
+        ctx.data_mut(|d| d.insert_temp(did, slot.clone()));
+        let mut st = slot.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((rk, ci)) = st.ready.take() {
+            let size = [ci.size[0] as u32, ci.size[1] as u32];
+            let max = crate::frames::max_texture_side(ctx);
+            let fitted = crate::frames::fit_texture(ci, max);
+            let tex = match cached {
+                Some((_, old_tex, _)) if old_tex.size() == fitted.size => {
+                    let mut tex = old_tex.clone();
+                    tex.set(fitted, egui::TextureOptions::LINEAR);
+                    tex
+                }
+                _ => ctx.load_texture("footage-panel", fitted, egui::TextureOptions::LINEAR),
+            };
+            ctx.data_mut(|d| d.insert_temp(tid, (rk, tex.clone(), size)));
+            if rk == key {
+                return (Some((tex, size)), false);
+            }
+        }
+        if st.inflight != Some(key) {
+            st.inflight = Some(key);
+            let state = slot.state.clone();
+            let src = source.clone();
+            let f = footage.clone();
+            let c = ctx.clone();
+            let _ = std::thread::Builder::new().name("ec-footage-panel".into()).spawn(move || {
+                let img = src.frame(item, &f, time);
+                let mut st = state.lock().unwrap_or_else(PoisonError::into_inner);
+                if let Some(img) = img {
+                    let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.to_rgba8());
+                    st.ready = Some((key, ci));
+                }
+                if st.inflight == Some(key) {
+                    st.inflight = None;
+                }
+                c.request_repaint();
+            });
+        }
+        let pending = st.inflight.is_some();
+        (cached.as_ref().map(|(_, tex, size)| (tex.clone(), *size)), pending)
+    }
+}
 
 pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     let t = app.tokens;
@@ -54,26 +154,25 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
     p.rect_filled(Rect::from_min_max(pos2(rect.min.x, ruler.min.y - 4.0), rect.max), 0.0, t.panel_bg);
     // Canvas.
     let area = Rect::from_min_max(pos2(rect.min.x, top.max.y), pos2(rect.max.x, ruler.min.y - 4.0));
+    let mut decoding = false;
     if let Some(f) = &footage
         && f.has_video
     {
         let key = (view.item.0, view.time.0, app.session.revision);
         let tid = egui::Id::new("footage-panel-tex");
-        let cached: Option<((u64, i64, u64), egui::TextureHandle, [u32; 2])> = ctx.data(|d| d.get_temp(tid));
-        let tex = match cached {
-            Some((k, tex, size)) if k == key => Some((tex, size)),
-            _ => app.session.footage.frame(view.item, f, view.time).map(|img| {
-                let ci = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.to_rgba8());
-                let tex = crate::frames::load_fitted(&ctx, "footage-panel", ci, egui::TextureOptions::LINEAR);
-                ctx.data_mut(|d| d.insert_temp(tid, (key, tex.clone(), [img.width, img.height])));
-                (tex, [img.width, img.height])
-            }),
-        };
+        let cached: Option<(FootageKey, egui::TextureHandle, [u32; 2])> = ctx.data(|d| d.get_temp(tid));
+        let (tex, pending) = poll_or_request_frame(&ctx, &app.session.footage, view.item, f, view.time, key, &cached);
+        decoding = pending;
         if let Some((tex, [w, h])) = tex {
             let s = ((area.width() - 20.0) / w as f32).min((area.height() - 20.0) / h as f32).max(0.01);
             let r = Rect::from_center_size(area.center(), vec2(w as f32 * s, h as f32 * s));
             super::viewer::checker(&p.with_clip_rect(area), r);
             p.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        } else if let Some(why) = app.session.footage.problem(f) {
+            let mut job = egui::text::LayoutJob::simple(why, Tokens::ui(12.0), t.warning, (area.width() - 24.0).max(40.0));
+            job.halign = egui::Align::Center;
+            let galley = p.layout_job(job);
+            p.galley(pos2(area.center().x, area.center().y - galley.size().y * 0.5), galley, t.warning);
         }
     } else if let ItemKind::Solid(so) = &item.kind {
         let c = so.color;
@@ -105,14 +204,17 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let s = ((pt.x - ruler.min.x) / ruler.width()).clamp(0.0, 1.0) as f64 * dur.seconds();
         kit::exec(app, "footage.setTime", json!({"time": s}));
     }
-    // Playback.
+    // Playback: wait for the current async frame decode before advancing so slow decoders never
+    // freeze the UI thread or overrun the clip.
     let play_id = egui::Id::new("footage-playing");
     let playing: bool = ctx.data(|d| d.get_temp(play_id).unwrap_or(false));
     if playing {
-        let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
-        let next = view.time.seconds() + dt;
-        let next = if next >= dur.seconds() - fr.frame_duration().seconds() { 0.0 } else { next };
-        let _ = app.session.execute("footage.setTime", json!({"time": next}));
+        if !decoding {
+            let dt = ctx.input(|i| i.stable_dt).min(0.1) as f64;
+            let next = view.time.seconds() + dt;
+            let next = if next >= dur.seconds() - fr.frame_duration().seconds() { 0.0 } else { next };
+            let _ = app.session.execute("footage.setTime", json!({"time": next}));
+        }
         ctx.request_repaint();
     }
     // Controls.

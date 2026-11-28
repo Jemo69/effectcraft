@@ -40,7 +40,7 @@ const MAX_KEEPERS: usize = 64;
 /// GPU frames kept for RAM preview (bytes of video memory) at first. wgpu can't tell how much
 /// video memory there is: each time the device runs out, the budget halves (to
 /// [`MIN_GPU_BUDGET`]) and the frame renders on the CPU (#106).
-const GPU_BUDGET: usize = 1 << 30;
+const GPU_BUDGET: usize = if cfg!(target_os = "android") { 256 << 20 } else { 1 << 30 };
 const MIN_GPU_BUDGET: usize = 64 << 20;
 
 /// A rendered viewer frame: CPU pixels or a GPU texture.

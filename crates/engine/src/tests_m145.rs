@@ -220,6 +220,19 @@ fn web_cache_budgets_leave_room_for_the_decoders() {
 }
 
 #[test]
+fn android_cache_budgets_cap_for_mobile_ram() {
+    use crate::prefs::{ANDROID_LAYER_CACHE, ANDROID_MEDIA_CACHE, ANDROID_PREVIEW_CACHE};
+    use crate::sysinfo::SysMemory;
+    let p = crate::prefs::Prefs::default();
+    let android = p.cache_budgets_for(None, false, true);
+    assert_eq!((android.layer as u64, android.media as u64, android.preview as u64), (ANDROID_LAYER_CACHE, ANDROID_MEDIA_CACHE, ANDROID_PREVIEW_CACHE));
+    // A 6 GiB tablet with 2.4 GiB available still scales safely below desktop 5 GiB defaults.
+    let tablet = SysMemory { total: 6 << 30, available: 2400 << 20 };
+    let b = p.cache_budgets_for(Some(tablet), false, true);
+    assert!(b.layer + b.media + b.preview <= (1200 << 20) + 16, "{b:?}");
+}
+
+#[test]
 fn motion_path_span_follows_the_composition_setting() {
     let mut p = crate::prefs::Prefs::default();
     let s = |x: f64| Tick::from_seconds_f64(x);

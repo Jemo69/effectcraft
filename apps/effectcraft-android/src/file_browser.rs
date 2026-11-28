@@ -9,7 +9,43 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use effectcraft_engine::media_browser::{self, Browser};
 use effectcraft_ui_egui::{DialogDone, FileDialog};
+
+/// Shared Android media subfolders where screen recordings, camera clips and downloads live.
+const SHARED_MEDIA_DIRS: &[&str] = &["Download", "Movies", "Movies/Screen recordings", "DCIM", "DCIM/Screen recordings", "Pictures", "Recordings"];
+
+/// Android Media Browser backend (`Session::browser`), starting in app internal storage
+/// instead of `/` (there is no `HOME` on Android) and listing shared media folders as places.
+pub struct AndroidBrowser {
+    home: PathBuf,
+}
+
+impl AndroidBrowser {
+    pub fn new(data_dir: Option<PathBuf>) -> Self {
+        Self { home: data_dir.unwrap_or_else(|| PathBuf::from("/")) }
+    }
+}
+
+impl Browser for AndroidBrowser {
+    fn home(&self) -> String {
+        self.home.to_string_lossy().to_string()
+    }
+
+    fn places(&self) -> Vec<(String, String)> {
+        roots(Some(&self.home))
+            .into_iter()
+            .map(|p| {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("Storage").to_string();
+                (name, p.to_string_lossy().to_string())
+            })
+            .collect()
+    }
+
+    fn list(&self, dir: &str, importable_only: bool) -> Result<Vec<media_browser::Entry>, String> {
+        media_browser::list(dir, importable_only).map_err(|e| format_dir_error(Path::new(dir), &e))
+    }
+}
 
 /// One row in the browser list.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,9 +68,13 @@ pub struct Pending {
     done: Option<DialogDone>,
 }
 
-/// Roots to offer: the app's data dir first, then its internal parent, then shared folders
-/// when they exist. All I/O errors become an empty list, never a crash.
+/// Roots to offer: the app's data dir first, then its internal parent, then shared media
+/// folders (`Download`, `Movies`, `DCIM`, `Pictures`, `Recordings`) when they exist.
 pub fn roots(data_dir: Option<&Path>) -> Vec<PathBuf> {
+    roots_with_bases(data_dir, &["/sdcard", "/storage/emulated/0"])
+}
+
+fn roots_with_bases(data_dir: Option<&Path>, shared_bases: &[&str]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(d) = data_dir {
         out.push(d.to_path_buf());
@@ -45,19 +85,36 @@ pub fn roots(data_dir: Option<&Path>) -> Vec<PathBuf> {
             }
         }
     }
-    for shared in ["/sdcard/Download", "/sdcard/DCIM", "/storage/emulated/0/Download", "/storage/emulated/0/DCIM"] {
-        let p = PathBuf::from(shared);
-        if p.is_dir() && !out.contains(&p) {
-            out.push(p);
+    for sub in SHARED_MEDIA_DIRS {
+        for base in shared_bases {
+            let p = Path::new(base).join(sub);
+            if p.is_dir() && !out.contains(&p) {
+                out.push(p);
+                break;
+            }
         }
     }
     out
 }
 
+fn format_dir_error(dir: &Path, err: &str) -> String {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("permission denied") || lower.contains("operation not permitted") {
+        format!(
+            "{}: permission denied — grant Photos and videos permission in Android App Settings, or copy the file into EffectCraft's internal folder",
+            dir.display()
+        )
+    } else {
+        err.to_string()
+    }
+}
+
 /// List `dir`: directories first, then files, each by name (case-insensitive). At most 2000
 /// entries; unreadable directories become an error string, not a crash.
 pub fn list_dir(dir: &Path) -> Result<Vec<Entry>, String> {
-    let read = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let read = std::fs::read_dir(dir).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied { format_dir_error(dir, "permission denied") } else { format!("{}: {e}", dir.display()) }
+    })?;
     let mut entries = Vec::new();
     for e in read {
         let Ok(e) = e else { continue };
@@ -408,5 +465,29 @@ mod tests {
         assert_eq!(title(&FileDialog::Open { exts: Vec::new(), many: false }), "Import files");
         assert_eq!(title(&FileDialog::OpenProject), "Open project");
         assert_eq!(title(&FileDialog::Folder), "Choose folder");
+    }
+
+    #[test]
+    fn roots_include_movies_and_screen_recording_folders() {
+        let base = std::env::temp_dir()
+            .join(format!("ec-android-roots-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)));
+        let data = base.join("app/files/EffectCraft");
+        let sd = base.join("sdcard");
+        let emu = base.join("emulated");
+        let _ = std::fs::create_dir_all(&data);
+        let _ = std::fs::create_dir_all(sd.join("Movies/Screen recordings"));
+        let _ = std::fs::create_dir_all(emu.join("Download"));
+        let _ = std::fs::create_dir_all(emu.join("Movies"));
+        let sd_str = sd.to_string_lossy().to_string();
+        let emu_str = emu.to_string_lossy().to_string();
+        let found = roots_with_bases(Some(&data), &[&sd_str, &emu_str]);
+        assert!(found.contains(&sd.join("Movies/Screen recordings")));
+        assert!(found.contains(&emu.join("Download")));
+        assert!(found.contains(&sd.join("Movies")));
+        // AndroidBrowser starts in data_dir rather than `/`.
+        let browser = AndroidBrowser::new(Some(data.clone()));
+        assert_eq!(browser.home(), data.to_string_lossy());
+        assert!(format_dir_error(Path::new("/sdcard/Movies"), "Permission denied (os error 13)").contains("Photos and videos permission"));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

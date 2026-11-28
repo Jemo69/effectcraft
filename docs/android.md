@@ -47,7 +47,7 @@ audio it wires up are platform-neutral, so the gate lints and tests them on the 
 
 | Desktop | Android |
 |---|---|
-| `rfd` file and message dialogs | in-app browser (`Hooks::file_dialog_async` in `apps/effectcraft-android/src/file_browser.rs`): the workspace's own internal storage, with `Download`/`DCIM` offered as Location shortcuts when readable; the commands stay drivable with `paths`/`path` parameters too, as on the web |
+| `rfd` file and message dialogs | in-app browser (`Hooks::file_dialog_async` in `apps/effectcraft-android/src/file_browser.rs`) and Android `MediaBrowser`: the workspace's own internal storage, with `Download`/`Movies`/`DCIM`/`Pictures`/`Recordings` offered as shortcuts when readable; the manifest declares `READ_MEDIA_VIDEO`/`IMAGES`/`AUDIO` (and `READ_EXTERNAL_STORAGE` on API ≤ 32); commands stay drivable with `paths`/`path` parameters too, as on the web |
 | `cpal` preview audio | wired to AAudio through cpal (`src/audio_out.rs`, same design as the desktop app); needs API 26 (Android 8.0), so `min_sdk_version` is 26 |
 | config directory (`~/…/EffectCraft`) | the app's own internal storage, `<internal data>/EffectCraft` (settings, shortcuts, auto-saves, models, `Plug-ins`, `Logs/`), from `AndroidApp::internal_data_path` — there is no `HOME` on Android |
 | window geometry tracker, macOS menu bar, launch guard | not needed: one full-screen window, no menu bar |
@@ -72,13 +72,15 @@ is attached.
 ## Known gaps (first slice)
 
 - **File dialogs**: the in-app browser covers internal storage, and offers shared
-  `Download`/`DCIM` as Location shortcuts when the platform lets us read them. It wires
-  `Hooks::file_dialog_async` for command dialogs only. The blocking pickers used by Settings
-  paths, Render Queue output and script import/export are not wired, so those controls stay
-  unsupported on Android; commands remain drivable over the control channel with explicit
-  `paths`/`path` parameters. There is no system picker (that needs Java) and no runtime
-  permission request yet, so other shared folders are out of reach; copy the file into the app's
-  folder and pick it there in that case.
+  `Download`/`Movies`/`DCIM`/`Pictures`/`Recordings` shortcuts when readable. The manifest
+  declares `READ_MEDIA_VIDEO`, `READ_MEDIA_IMAGES`, `READ_MEDIA_AUDIO`, and
+  `READ_EXTERNAL_STORAGE` (API ≤ 32). It wires `Hooks::file_dialog_async` for command dialogs
+  only. The blocking pickers used by Settings paths, Render Queue output and script
+  import/export are not wired, so those controls stay unsupported on Android; commands remain
+  drivable over the control channel with explicit `paths`/`path` parameters. There is no system
+  picker or in-app runtime permission prompt yet (those need Java/JNI), so on Android 11+
+  grant Photos and videos access in Android App Settings or copy the file into the app's
+  folder and pick it there.
 - **Browser labels** are English strings: `effectcraft-ui-egui` keeps its translation lookup
   private to the crate, so this first slice does not route them through the language catalog.
 - **Preview audio**: wired through cpal/AAudio (API 26+); untested on a physical tablet, and

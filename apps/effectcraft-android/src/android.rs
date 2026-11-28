@@ -81,6 +81,7 @@ pub(crate) fn run(android_app: AndroidApp) {
             // Lazy open and non-blocking auto-save (M13.14), as on the desktop.
             session.check_footage_on_open = true;
             session.autosave.background = true;
+            session.browser = Some(Arc::new(file_browser::AndroidBrowser::new(data.clone())));
             // The browser starts where the data lives (always readable).
             let browser_start = data.clone();
             if let Some(dir) = data {
@@ -92,6 +93,8 @@ pub(crate) fn run(android_app: AndroidApp) {
                 session.config = Some(Arc::new(effectcraft_engine::config::DirConfig::new(dir)));
             }
             session.load_settings();
+            session.memory_watch.poll();
+            session.apply_cache_budgets();
             let _ = session.execute("window.restoreScriptPanels", json!({}));
             let mut app = EffectcraftApp::new(session);
             app.set_gpu_failure_bridge(gpu_failures);

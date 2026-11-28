@@ -113,7 +113,7 @@ pub fn parse_freebsd_sysctl(text: &str) -> Option<SysMemory> {
 
 /// Total and available physical memory, when the system reports them.
 pub fn memory() -> Option<SysMemory> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         return parse_meminfo(&std::fs::read_to_string("/proc/meminfo").ok()?);
     }
@@ -141,10 +141,15 @@ pub fn memory() -> Option<SysMemory> {
 
 /// CPU model name.
 pub fn cpu_name() -> Option<String> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let t = std::fs::read_to_string("/proc/cpuinfo").ok()?;
-        return t.lines().find(|l| l.starts_with("model name")).and_then(|l| l.split(':').nth(1)).map(|s| s.trim().to_string());
+        for key in ["model name", "Hardware", "Processor"] {
+            if let Some(v) = t.lines().find(|l| l.starts_with(key)).and_then(|l| l.split(':').nth(1)).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                return Some(v);
+            }
+        }
+        return None;
     }
     #[cfg(target_os = "macos")]
     {

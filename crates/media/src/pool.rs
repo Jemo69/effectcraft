@@ -214,6 +214,19 @@ struct Inner {
     /// Movies that failed to open or decode (path to a readable reason; see
     /// [`FootageSource::problem`]). The first failure of a file is logged, later ones are not.
     problems: Mutex<HashMap<Arc<str>, String>>,
+    /// Single bounded read-ahead worker channel so sequential playback does not spawn an OS
+    /// thread per frame (#android-playback).
+    #[cfg(not(target_arch = "wasm32"))]
+    prefetch_tx: OnceLock<std::sync::mpsc::SyncSender<PrefetchJob>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct PrefetchJob {
+    inner: Arc<Inner>,
+    footage: Footage,
+    t: Tick,
+    size: Option<(u32, u32)>,
+    float: FloatCurve,
 }
 
 /// Decodes footage for the renderer: stills, image sequences and movies (FilmCraft codecs), plus
@@ -284,6 +297,8 @@ impl MediaPool {
                 conforming: Mutex::default(),
                 conform_failed: Mutex::default(),
                 problems: Mutex::default(),
+                #[cfg(not(target_arch = "wasm32"))]
+                prefetch_tx: OnceLock::new(),
             }),
         }
     }
@@ -769,12 +784,18 @@ impl Inner {
 
     #[cfg(not(target_arch = "wasm32"))]
     fn prefetch(self: &Arc<Self>, footage: &Footage, t: Tick, size: Option<(u32, u32)>, float: FloatCurve) {
-        let (me, f) = (self.clone(), footage.clone());
-        self.prefetched.fetch_add(1, Ordering::Relaxed);
-        // A plain thread, not a rayon job: the decode below parallelises with rayon itself.
-        std::thread::spawn(move || {
-            let _ = me.frame_at(&f, t, false, size, float);
+        let tx = self.prefetch_tx.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<PrefetchJob>(2);
+            let _ = std::thread::Builder::new().name("ec-media-prefetch".into()).spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    let _ = Inner::frame_at(&job.inner, &job.footage, job.t, false, job.size, job.float);
+                }
+            });
+            tx
         });
+        if tx.try_send(PrefetchJob { inner: self.clone(), footage: footage.clone(), t, size, float }).is_ok() {
+            self.prefetched.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     #[cfg(target_arch = "wasm32")]

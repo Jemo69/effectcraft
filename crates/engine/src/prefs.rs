@@ -797,21 +797,36 @@ impl Prefs {
     /// In the browser the layer and footage caches also stay within [`WEB_LAYER_CACHE`] and
     /// [`WEB_MEDIA_CACHE`].
     pub fn cache_budgets(&self, mem: Option<crate::sysinfo::SysMemory>) -> CacheBudgets {
-        self.cache_budgets_in(mem, cfg!(target_arch = "wasm32"))
+        self.cache_budgets_for(mem, cfg!(target_arch = "wasm32"), cfg!(target_os = "android"))
     }
 
     /// [`Prefs::cache_budgets`], in the browser's memory (`web`) or not.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn cache_budgets_in(&self, mem: Option<crate::sysinfo::SysMemory>, web: bool) -> CacheBudgets {
+        self.cache_budgets_for(mem, web, false)
+    }
+
+    /// [`Prefs::cache_budgets`], with platform caps for `web` and `android`.
+    pub(crate) fn cache_budgets_for(&self, mem: Option<crate::sysinfo::SysMemory>, web: bool, android: bool) -> CacheBudgets {
         let (mut l, mut m, mut p) = (self.layer_cache_bytes() as u64, self.media_cache_bytes() as u64, self.preview_cache_bytes() as u64);
         if web {
             (l, m) = (l.min(WEB_LAYER_CACHE), m.min(WEB_MEDIA_CACHE));
+        }
+        if android {
+            (l, m, p) = (l.min(ANDROID_LAYER_CACHE), m.min(ANDROID_MEDIA_CACHE), p.min(ANDROID_PREVIEW_CACHE));
         }
         let floor = 64u64 << 20;
         let mut capped = false;
         let mut reduced = false;
         if let Some(mem) = mem.filter(|m| m.total > 0) {
-            let reserved = (self.memory.ram_reserved_gb as u64) << 30;
-            let cap = mem.total.saturating_sub(reserved).max(3 * floor);
+            let cap = if android {
+                // Mobile devices share unified RAM with Android's LMK and GPU; leave most of
+                // system RAM free rather than subtracting the desktop 6 GiB reserve.
+                (mem.available / 2).min(mem.total / 3).max(3 * floor)
+            } else {
+                let reserved = (self.memory.ram_reserved_gb as u64) << 30;
+                mem.total.saturating_sub(reserved).max(3 * floor)
+            };
             let sum = l + m + p;
             if sum > cap {
                 let k = cap as f64 / sum as f64;
@@ -978,6 +993,11 @@ pub const WEB_LAYER_CACHE: u64 = 512 << 20;
 
 /// The most the footage frame cache holds in the browser (see [`WEB_LAYER_CACHE`]).
 pub const WEB_MEDIA_CACHE: u64 = 256 << 20;
+
+/// Mobile cache ceilings for Android devices (unified CPU/GPU RAM and Android's LMK).
+pub const ANDROID_LAYER_CACHE: u64 = 256 << 20;
+pub const ANDROID_MEDIA_CACHE: u64 = 256 << 20;
+pub const ANDROID_PREVIEW_CACHE: u64 = 512 << 20;
 
 /// Effective cache budgets in bytes (see [`Prefs::cache_budgets`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

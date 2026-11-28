@@ -326,17 +326,78 @@ fn web(args: &[String]) -> Result<(), String> {
 
 /// The Android NDK: `ANDROID_NDK_ROOT` / `ANDROID_NDK_HOME`, else the newest under the SDK's
 /// `ndk/` folder (`ANDROID_HOME` or `ANDROID_SDK_ROOT`).
+fn android_sdk() -> Result<std::path::PathBuf, String> {
+    std::env::var_os("ANDROID_HOME")
+        .or_else(|| std::env::var_os("ANDROID_SDK_ROOT"))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "no Android SDK: set ANDROID_HOME or ANDROID_SDK_ROOT".to_string())
+}
+
 fn android_ndk() -> Result<std::ffi::OsString, String> {
     if let Some(ndk) = std::env::var_os("ANDROID_NDK_ROOT").or_else(|| std::env::var_os("ANDROID_NDK_HOME")) {
         return Ok(ndk);
     }
-    let sdk = std::env::var_os("ANDROID_HOME")
-        .or_else(|| std::env::var_os("ANDROID_SDK_ROOT"))
-        .map(std::path::PathBuf::from)
-        .ok_or("no Android NDK: set ANDROID_NDK_ROOT, or ANDROID_HOME with an NDK in <sdk>/ndk")?;
+    let sdk = android_sdk().map_err(|_| "no Android NDK: set ANDROID_NDK_ROOT, or ANDROID_HOME with an NDK in <sdk>/ndk".to_string())?;
     let mut versions: Vec<_> = std::fs::read_dir(sdk.join("ndk")).map_err(|e| format!("{}: {e}", sdk.display()))?.flatten().map(|e| e.file_name()).collect();
     versions.sort();
     versions.pop().map(|v| sdk.join("ndk").join(v).into_os_string()).ok_or_else(|| format!("{}: no NDK installed (sdkmanager --install ndk;…)", sdk.display()))
+}
+
+fn android_build_tools() -> Result<std::path::PathBuf, String> {
+    let sdk = android_sdk()?;
+    let mut versions: Vec<_> =
+        std::fs::read_dir(sdk.join("build-tools")).map_err(|e| format!("{}: {e}", sdk.display()))?.flatten().map(|e| e.file_name()).collect();
+    versions.sort();
+    versions.pop().map(|v| sdk.join("build-tools").join(v)).ok_or_else(|| format!("{}: no build-tools installed", sdk.display()))
+}
+
+fn android_abi(target: &str) -> Result<&'static str, String> {
+    match target {
+        "aarch64-linux-android" => Ok("arm64-v8a"),
+        "x86_64-linux-android" => Ok("x86_64"),
+        "armv7-linux-androideabi" => Ok("armeabi-v7a"),
+        "i686-linux-android" => Ok("x86"),
+        _ => Err(format!("unsupported Android target `{target}`")),
+    }
+}
+
+fn pack_and_sign_release_apk(apk_dir: &std::path::Path, target: &str) -> Result<(), String> {
+    let abi = android_abi(target)?;
+    let unaligned = apk_dir.join("effectcraft-unaligned.apk");
+    let so_rel = format!("lib/{abi}/libeffectcraft_android.so");
+    if !unaligned.is_file() || !apk_dir.join(&so_rel).is_file() {
+        return Err(format!("release build did not produce {} and {}", unaligned.display(), apk_dir.join(&so_rel).display()));
+    }
+    let tools = android_build_tools()?;
+    let zipalign = tools.join("zipalign");
+    let apksigner = tools.join("apksigner");
+    let staged = apk_dir.join(format!("effectcraft-{target}-staged.apk"));
+    let aligned = apk_dir.join(format!("effectcraft-{target}-aligned.apk"));
+    let final_apk = apk_dir.join("effectcraft.apk");
+    std::fs::copy(&unaligned, &staged).map_err(|e| format!("copy {}: {e}", unaligned.display()))?;
+    let mut zip_cmd = Command::new("zip");
+    zip_cmd.current_dir(apk_dir).args(["-0", "-q"]).arg(&staged).arg(&so_rel);
+    run(&mut zip_cmd)?;
+    run(Command::new(&zipalign).args(["-f", "-p", "4"]).arg(&staged).arg(&aligned))?;
+    let (keystore, ks_pass, label) = match std::env::var_os("EFFECTCRAFT_ANDROID_KEYSTORE") {
+        Some(ks) => (
+            std::path::PathBuf::from(ks),
+            std::env::var("EFFECTCRAFT_ANDROID_KEYSTORE_PASS").unwrap_or_else(|_| "pass:android".into()),
+            "configured release keystore",
+        ),
+        None => {
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from).ok_or("HOME not set for ~/.android/debug.keystore")?;
+            (home.join(".android/debug.keystore"), "pass:android".to_string(), "debug keystore (preview release)")
+        }
+    };
+    if !keystore.is_file() {
+        return Err(format!("Android keystore not found at {}", keystore.display()));
+    }
+    run(Command::new(&apksigner).args(["sign", "--ks"]).arg(&keystore).args(["--ks-pass", &ks_pass, "--out"]).arg(&final_apk).arg(&aligned))?;
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_file(&aligned);
+    println!("android: signed release APK with {label} ({})", keystore.display());
+    Ok(())
 }
 
 /// Build the Android APK with `cargo apk` (`apps/effectcraft-android`, docs/android.md):
@@ -358,6 +419,16 @@ fn android(args: &[String]) -> Result<(), String> {
         return Err("cargo-apk not found: cargo install cargo-apk --locked (docs/android.md)".into());
     }
     let ndk = android_ndk()?;
+    let dir = target_dir();
+    let dir = if dir.is_absolute() { dir } else { root().join(dir) };
+    let profile = if release { "release" } else { "debug" };
+    let apk_dir = dir.join(profile).join("apk");
+    let has_release_signing = std::fs::read_to_string(root().join("apps/effectcraft-android/Cargo.toml"))
+        .map(|s| s.contains("[package.metadata.android.signing.release]"))
+        .unwrap_or(false);
+    if release && !has_release_signing {
+        let _ = std::fs::remove_file(apk_dir.join("effectcraft-unaligned.apk"));
+    }
     let mut build = Command::new(env!("CARGO"));
     build.current_dir(root().join("apps/effectcraft-android"));
     build.args(["apk", "build", "--target", &target]);
@@ -371,17 +442,20 @@ fn android(args: &[String]) -> Result<(), String> {
     // crate for idna_adapter` / `crate ndk required to be available in rlib format`). Android
     // target dirs are slow to link anyway; disable incremental for reliable APK builds.
     build.env("CARGO_INCREMENTAL", "0");
-    run(&mut build)?;
-    let dir = target_dir();
-    let dir = if dir.is_absolute() { dir } else { root().join(dir) };
-    let profile = if release { "release" } else { "debug" };
-    let apk = dir.join(profile).join("apk").join("effectcraft.apk");
+    if let Err(err) = run(&mut build) {
+        if release && !has_release_signing && apk_dir.join("effectcraft-unaligned.apk").is_file() {
+            pack_and_sign_release_apk(&apk_dir, &target)?;
+        } else {
+            return Err(err);
+        }
+    }
+    let apk = apk_dir.join("effectcraft.apk");
     if !apk.is_file() {
         return Err(format!("{} was not produced", apk.display()));
     }
     // `cargo apk` always writes the same path, so a device (arm64) build overwrites an emulator
     // (x86_64) one and vice versa. Keep a target-specific copy beside it.
-    let tagged = dir.join(profile).join("apk").join(format!("effectcraft-{target}.apk"));
+    let tagged = apk_dir.join(format!("effectcraft-{target}.apk"));
     if std::fs::copy(&apk, &tagged).is_ok() {
         println!("android: {} (also {})", apk.display(), tagged.display());
     } else {

@@ -30,6 +30,7 @@ crate-type = ["cdylib", "rlib"]
 # compile (and their tests run) on the host too — `cargo xtask ci` lints and tests them there.
 # The shell itself is Android-only below.
 [dependencies]
+effectcraft-engine = { workspace = true }
 effectcraft-ui-egui = { workspace = true }
 egui = { workspace = true }
 log = { workspace = true }
@@ -38,7 +39,6 @@ log = { workspace = true }
 cpal = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
-effectcraft-engine = { workspace = true }
 effectcraft-host = { workspace = true }
 serde_json = { workspace = true }
 # Blocking on the Vulkan adapter probe of `gpu_backends` before the event loop starts.
@@ -61,6 +61,23 @@ strip = "default"
 # AAudio (preview audio via cpal) needs API 26 (Android 8.0); older tablets stay on the web build.
 min_sdk_version = 26
 target_sdk_version = 34
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_VIDEO"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_IMAGES"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_MEDIA_AUDIO"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.READ_EXTERNAL_STORAGE"
+max_sdk_version = 32
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.WRITE_EXTERNAL_STORAGE"
+max_sdk_version = 29
 
 [package.metadata.android.application]
 label = "EffectCraft"
